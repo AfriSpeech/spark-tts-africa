@@ -11,7 +11,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 import numpy as np
 import soundfile as sf
@@ -106,3 +106,51 @@ def format_spark_sequence(text: str, global_tokens: str, semantic_tokens: str) -
         "<|start_semantic_token|>", semantic_tokens, "<|end_semantic_token|>",
         "<|im_end|>",
     ])
+
+
+class DataCollatorForTTSCompletion:
+    """Collates sequences for TTS completion training (masks prompt tokens to -100)."""
+
+    def __init__(self, tokenizer, global_start_token: str = "<|start_global_token|>"):
+        self.tokenizer = tokenizer
+        self.global_start_token = global_start_token
+        self.global_start_id = tokenizer.convert_tokens_to_ids(global_start_token)
+        self.pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 151643
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        batch_input_ids = [f["input_ids"] for f in features]
+        batch_attn_mask = [f.get("attention_mask", [1] * len(f["input_ids"])) for f in features]
+
+        max_len = max(len(ids) for ids in batch_input_ids)
+        padded_input_ids = []
+        padded_attn_mask = []
+        padded_labels = []
+
+        for input_ids, attn_mask in zip(batch_input_ids, batch_attn_mask):
+            pad_len = max_len - len(input_ids)
+            p_ids = input_ids + [self.pad_id] * pad_len
+            p_mask = attn_mask + [0] * pad_len
+
+            labels = list(p_ids)
+            try:
+                split_idx = input_ids.index(self.global_start_id)
+            except ValueError:
+                split_idx = 0
+
+            # Mask out the text prompt tokens
+            for idx in range(split_idx):
+                labels[idx] = -100
+            # Mask out pad tokens
+            for idx in range(len(input_ids), max_len):
+                labels[idx] = -100
+
+            padded_input_ids.append(p_ids)
+            padded_attn_mask.append(p_mask)
+            padded_labels.append(labels)
+
+        return {
+            "input_ids": torch.tensor(padded_input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(padded_attn_mask, dtype=torch.long),
+            "labels": torch.tensor(padded_labels, dtype=torch.long),
+        }
+

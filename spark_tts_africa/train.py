@@ -25,11 +25,13 @@ from datasets import Dataset, concatenate_datasets, load_from_disk
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    DataCollatorForLanguageModeling,
+    PreTrainedTokenizerFast,
     Trainer,
     TrainerCallback,
     TrainingArguments,
 )
+
+from spark_tts_africa.data import DataCollatorForTTSCompletion
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -38,14 +40,15 @@ logger = logging.getLogger(__name__)
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model_dir", type=str, default="/mnt/volume_d2wey28/models/Spark-TTS-0.5B/LLM")
+    parser.add_argument("--tokenizer_dir", type=str, default="/mnt/volume_d2wey28/data/spark-tts-africa/tokenizer_4k")
     parser.add_argument("--train_data", type=str, required=True, help="Path to tokenized train dataset directory or arrow/parquet")
     parser.add_argument("--val_data", type=str, default=None, help="Path to tokenized validation dataset")
     parser.add_argument("--output_dir", type=str, default="checkpoints/spark_tts_africa")
-    parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--grad_accum", type=int, default=4)
-    parser.add_argument("--max_steps", type=int, default=20000)
-    parser.add_argument("--warmup_steps", type=int, default=500)
+    parser.add_argument("--max_steps", type=int, default=30000)
+    parser.add_argument("--warmup_steps", type=int, default=200)
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--eval_steps", type=int, default=250)
     parser.add_argument("--early_stopping_patience", type=int, default=15)
@@ -74,7 +77,9 @@ class EarlyStoppingCallback(TrainerCallback):
             # Save best checkpoint
             os.makedirs(best_dir, exist_ok=True)
             kwargs["model"].save_pretrained(best_dir)
-            kwargs["tokenizer"].save_pretrained(best_dir)
+            tok = kwargs.get("processing_class") or kwargs.get("tokenizer")
+            if tok:
+                tok.save_pretrained(best_dir)
             with open(os.path.join(best_dir, "best_meta.json"), "w") as f:
                 json.dump({"step": state.global_step, "eval_loss": eval_loss}, f, indent=2)
         else:
@@ -91,13 +96,58 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # 1. Load or Build 4K African Tokenizer
+    if os.path.exists(os.path.join(args.tokenizer_dir, "tokenizer.json")):
+        logger.info(f"Loading 4K African Tokenizer from {args.tokenizer_dir}...")
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(args.tokenizer_dir)
+    else:
+        logger.info("Building 4K African Tokenizer from ipa_sp4000.json and Spark-TTS tokens...")
+        os.makedirs(args.tokenizer_dir, exist_ok=True)
+        sp_file = "/mnt/volume_d2wey28/data/africa-tts/tok/ipa_sp4000.json"
+        tokenizer = PreTrainedTokenizerFast(tokenizer_file=sp_file)
+        tokenizer.pad_token = "<|endoftext|>"
+        tokenizer.eos_token = "<|im_end|>"
+        special_tokens = [
+            "<|task_tts|>", "<|start_content|>", "<|end_content|>",
+            "<|start_global_token|>", "<|end_global_token|>",
+            "<|start_semantic_token|>", "<|end_semantic_token|>",
+            "<|im_end|>", "<|endoftext|>",
+        ]
+        global_tokens = [f"<|bicodec_global_{i}|>" for i in range(4096)]
+        semantic_tokens = [f"<|bicodec_semantic_{i}|>" for i in range(8192)]
+        all_new = special_tokens + global_tokens + semantic_tokens
+        tokenizer.add_special_tokens({"additional_special_tokens": all_new})
+        tokenizer.save_pretrained(args.tokenizer_dir)
+
+    # 2. Load Base Model and perform Warm-Start Surgery
     logger.info(f"Loading base LLM from {args.model_dir}...")
+    base_tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_dir,
-        torch_dtype=torch.bfloat16,
-        device_map="cuda:0",
+        dtype=torch.bfloat16,
     )
-    tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
+
+    old_embed = model.model.embed_tokens.weight.data.clone()
+    target_vocab = len(tokenizer)
+    logger.info(f"Africa Warm-Start: Resizing embeddings from {model.config.vocab_size} to {target_vocab}...")
+    model.resize_token_embeddings(target_vocab)
+    model.config.vocab_size = target_vocab
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.eos_token_id = tokenizer.eos_token_id
+    model.config.bos_token_id = None
+
+    # Initialize 4K text embeddings with N(0, 0.04)
+    torch.nn.init.normal_(model.model.embed_tokens.weight.data[:4000], mean=0.0, std=0.04)
+
+    # Transfer pretrained codec and special token embeddings
+    transferred = 0
+    for token_str, new_id in tokenizer.get_vocab().items():
+        if new_id >= 4000:
+            old_id = base_tokenizer.convert_tokens_to_ids(token_str)
+            if old_id != base_tokenizer.unk_token_id and old_id < old_embed.size(0):
+                model.model.embed_tokens.weight.data[new_id] = old_embed[old_id]
+                transferred += 1
+    logger.info(f"Warm-Start: Transferred {transferred} pretrained acoustic & special token embeddings!")
 
     logger.info(f"Loading training data from {args.train_data}...")
     if os.path.isdir(args.train_data):
@@ -114,9 +164,9 @@ def main():
             val_ds = Dataset.from_parquet(args.val_data)
 
     def tokenize_fn(examples):
-        return tokenizer(examples["text"], truncation=True, max_length=2048)
+        return tokenizer(examples["text"], truncation=True, max_length=1024)
 
-    logger.info("Tokenizing dataset sequences...")
+    logger.info("Tokenizing dataset sequences with 4K African Tokenizer...")
     tokenized_train = train_ds.map(tokenize_fn, batched=True, remove_columns=train_ds.column_names)
     tokenized_val = val_ds.map(tokenize_fn, batched=True, remove_columns=val_ds.column_names) if val_ds else None
 
@@ -127,6 +177,11 @@ def main():
         learning_rate=args.learning_rate,
         max_steps=args.max_steps,
         warmup_steps=args.warmup_steps,
+        lr_scheduler_type="cosine",
+        max_grad_norm=1.0,
+        weight_decay=0.01,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=20,
         eval_strategy="steps" if val_ds else "no",
         eval_steps=args.eval_steps if val_ds else None,
@@ -141,9 +196,8 @@ def main():
 
     callbacks = [EarlyStoppingCallback(patience=args.early_stopping_patience, output_dir=args.output_dir)]
 
-    data_collator = DataCollatorForLanguageModeling(
+    data_collator = DataCollatorForTTSCompletion(
         tokenizer=tokenizer,
-        mlm=False,
     )
 
     trainer = Trainer(
