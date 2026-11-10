@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "spark-tts-africa"
+version = "0.1.0"
+description = "Spark-TTS 0.5B adapted for African languages with Africa-G2P and voice cloning"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [{name = "AfriSpeech"}]
+keywords = [
+    "tts",
+    "text-to-speech",
+    "speech-synthesis",
+    "zero-shot",
+    "voice-cloning",
+    "african-languages",
+    "spark-tts"
+]
+
+dependencies = [
+    "torch>=2.4",
+    "torchaudio>=2.4",
+    "transformers>=4.46.2",
+    "accelerate",
+    "peft",
+    "datasets",
+    "einops",
+    "einx",
+    "omegaconf",
+    "soundfile",
+    "soxr",
+    "phonemizer",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+africa = [
+    "africa-g2p",
+]
+
+[project.scripts]
+spark-tts-africa-infer = "spark_tts_africa.infer:main"
+spark-tts-africa-train = "spark_tts_africa.train:main"
+
+[tool.hatch.build.targets.sdist]
+include = ["spark_tts_africa"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["spark_tts_africa"]
