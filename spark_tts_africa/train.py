@@ -44,14 +44,17 @@ def parse_args():
     parser.add_argument("--train_data", type=str, required=True, help="Path to tokenized train dataset directory or arrow/parquet")
     parser.add_argument("--val_data", type=str, default=None, help="Path to tokenized validation dataset")
     parser.add_argument("--output_dir", type=str, default="checkpoints/spark_tts_africa")
-    parser.add_argument("--learning_rate", type=float, default=2e-5)
+    parser.add_argument("--stage1_steps", type=int, default=500, help="Steps for Stage 1: embedding alignment with frozen transformer layers")
+    parser.add_argument("--stage1_lr", type=float, default=1e-4, help="Learning rate for Stage 1")
+    parser.add_argument("--stage2_steps", type=int, default=30000, help="Steps for Stage 2: full joint fine-tuning")
+    parser.add_argument("--stage2_lr", type=float, default=2e-5, help="Learning rate for Stage 2")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--grad_accum", type=int, default=4)
-    parser.add_argument("--max_steps", type=int, default=30000)
     parser.add_argument("--warmup_steps", type=int, default=200)
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--eval_steps", type=int, default=250)
     parser.add_argument("--early_stopping_patience", type=int, default=15)
+    parser.add_argument("--skip_stage1", action="store_true", help="Skip Stage 1 and start directly at Stage 2")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     return parser.parse_args()
 
@@ -170,12 +173,77 @@ def main():
     tokenized_train = train_ds.map(tokenize_fn, batched=True, remove_columns=train_ds.column_names)
     tokenized_val = val_ds.map(tokenize_fn, batched=True, remove_columns=val_ds.column_names) if val_ds else None
 
-    training_args = TrainingArguments(
-        output_dir=args.output_dir,
+    data_collator = DataCollatorForTTSCompletion(
+        tokenizer=tokenizer,
+    )
+
+    # ----------------------------------------------------
+    # STAGE 1: Text Embedding Alignment (Frozen Backbone)
+    # ----------------------------------------------------
+    if not args.skip_stage1 and args.stage1_steps > 0:
+        logger.info("=" * 60)
+        logger.info(f"STARTING STAGE 1: Embedding Alignment ({args.stage1_steps} steps, lr={args.stage1_lr:.2e})")
+        logger.info("Freezing all 24 Transformer layers; only aligning text embeddings...")
+        logger.info("=" * 60)
+
+        for p in model.model.layers.parameters():
+            p.requires_grad = False
+        model.model.norm.weight.requires_grad = False
+
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"Stage 1 Trainable parameters: {trainable_params:,} (embed_tokens only)")
+
+        stage1_output_dir = os.path.join(args.output_dir, "stage1_embeddings")
+        stage1_args = TrainingArguments(
+            output_dir=stage1_output_dir,
+            per_device_train_batch_size=args.batch_size,
+            gradient_accumulation_steps=args.grad_accum,
+            learning_rate=args.stage1_lr,
+            max_steps=args.stage1_steps,
+            warmup_steps=min(50, args.stage1_steps // 5),
+            lr_scheduler_type="cosine",
+            max_grad_norm=1.0,
+            weight_decay=0.01,
+            logging_steps=20,
+            save_strategy="no",
+            eval_strategy="no",
+            bf16=True,
+            tf32=True,
+            dataloader_num_workers=4,
+            report_to="none",
+        )
+
+        stage1_trainer = Trainer(
+            model=model,
+            args=stage1_args,
+            train_dataset=tokenized_train,
+            processing_class=tokenizer,
+            data_collator=data_collator,
+        )
+        stage1_trainer.train()
+        logger.info("Stage 1 Embedding Alignment complete! Embeddings aligned with latent space.")
+
+    # ----------------------------------------------------
+    # STAGE 2: Joint Full Fine-Tuning (Unfrozen Backbone)
+    # ----------------------------------------------------
+    logger.info("=" * 60)
+    logger.info(f"STARTING STAGE 2: Joint Full Fine-Tuning ({args.stage2_steps} steps, lr={args.stage2_lr:.2e})")
+    logger.info("Unfreezing all 24 Transformer layers for end-to-end training...")
+    logger.info("=" * 60)
+
+    for p in model.parameters():
+        p.requires_grad = True
+
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Stage 2 Trainable parameters: {trainable_params:,} (full model)")
+
+    stage2_output_dir = os.path.join(args.output_dir, "stage2_full")
+    stage2_args = TrainingArguments(
+        output_dir=stage2_output_dir,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
-        learning_rate=args.learning_rate,
-        max_steps=args.max_steps,
+        learning_rate=args.stage2_lr,
+        max_steps=args.stage2_steps,
         warmup_steps=args.warmup_steps,
         lr_scheduler_type="cosine",
         max_grad_norm=1.0,
@@ -196,13 +264,9 @@ def main():
 
     callbacks = [EarlyStoppingCallback(patience=args.early_stopping_patience, output_dir=args.output_dir)]
 
-    data_collator = DataCollatorForTTSCompletion(
-        tokenizer=tokenizer,
-    )
-
-    trainer = Trainer(
+    stage2_trainer = Trainer(
         model=model,
-        args=training_args,
+        args=stage2_args,
         train_dataset=tokenized_train,
         eval_dataset=tokenized_val,
         processing_class=tokenizer,
@@ -210,8 +274,8 @@ def main():
         callbacks=callbacks,
     )
 
-    logger.info("Starting training loop...")
-    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+    logger.info("Starting Stage 2 training loop...")
+    stage2_trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
 
     final_dir = os.path.join(args.output_dir, "final_model")
     model.save_pretrained(final_dir)
