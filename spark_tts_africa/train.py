@@ -25,10 +25,10 @@ from datasets import Dataset, concatenate_datasets, load_from_disk
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    DataCollatorForLanguageModeling,
     Trainer,
     TrainerCallback,
     TrainingArguments,
-    default_data_collator,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -141,13 +141,18 @@ def main():
 
     callbacks = [EarlyStoppingCallback(patience=args.early_stopping_patience, output_dir=args.output_dir)]
 
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False,
+    )
+
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_train,
         eval_dataset=tokenized_val,
-        tokenizer=tokenizer,
-        data_collator=default_data_collator,
+        processing_class=tokenizer,
+        data_collator=data_collator,
         callbacks=callbacks,
     )
 
